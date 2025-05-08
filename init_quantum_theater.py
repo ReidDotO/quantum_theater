@@ -2048,7 +2048,7 @@ ANTHROPIC_API_KEY=your_anthropic_api_key_here
 ELEVENLABS_API_KEY=your_elevenlabs_api_key_here
 """
 
-with open('.env.template', 'w') as f:
+with open('.env', 'w') as f:
     f.write(env_template)
 
 print("=== Quantum Theater Initialization Complete ===")
@@ -2066,11 +2066,13 @@ print("- transformations.json")
 print("- tone.json")
 print("- narrative_structures.json")
 print("- marker_positions.json")
-print("- .env.template")
+print("- .env")
 print("\nNEXT STEPS:")
-print("1. Copy .env.template to .env and add your API keys")
+print("1. Add your API keys to the .env file")
 print("2. Make sure you have installed the required dependencies:")
-print("   pip install python-dotenv anthropic elevenlabs pygame")
-print("3. Run the quantum theater program:")
+print("   pip install python-dotenv anthropic elevenlabs pygame SpeechRecognition")
+print("3. Run the aruco_tracker program:")
+print("   python aruco_tracker.py")
+print("4. Run the quantum theater program:")
 print("   python quantum_theater.py")
 print("===================================")

@@ -1,0 +1,12 @@
+audio_outputs/
+narrative_elements/
+transcripts/
+simple_speech.py
+unused_picker.py
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+.env

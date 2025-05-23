@@ -6,7 +6,7 @@ Quantum Theater is an interactive playable adaptive experience that combines phy
 
 1. **Install Dependencies**:
    ```
-   pip install python-dotenv anthropic elevenlabs pygame SpeechRecognition
+   pip install python-dotenv anthropic elevenlabs pygame SpeechRecognition opencv-python numpy
    ```
    Maybe more? tbd
 

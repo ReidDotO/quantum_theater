@@ -11,3 +11,6 @@ __pycache__/
 *.pyz
 .env
 temp.py
+imgToAruco.py
+testAruco360.png
+view360.py

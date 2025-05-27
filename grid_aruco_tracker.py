@@ -8,21 +8,14 @@ from pathlib import Path
 def detect_aruco_markers():
     # Configuration flags
     USE_GRAYSCALE = True   # Set to True for grayscale conversion
-    USE_THRESHOLD = True   # Set to True for thresholding
-    THRESHOLD_VALUE = 127  # Threshold value (0-255)
+    USE_THRESHOLD = False   # Set to True for thresholding
+    THRESHOLD_VALUE = 0  # Threshold value (0-255)
     THRESHOLD_TYPE = cv2.THRESH_OTSU  # Threshold type
     
-    # Alternative threshold types:
-    # cv2.THRESH_BINARY_INV
-    # cv2.THRESH_TRUNC
-    # cv2.THRESH_TOZERO
-    # cv2.THRESH_TOZERO_INV
-    # cv2.THRESH_OTSU (automatic thresholding)
-    
     # Initialize the camera
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960) # Set width to 1280 pixels
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540) # Set height to 720 pixels
+    cap = cv2.VideoCapture(1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     
     # Check if camera opened successfully
     if not cap.isOpened():
@@ -42,11 +35,22 @@ def detect_aruco_markers():
     elem_dir = Path('narrative_elements')
     elem_dir.mkdir(exist_ok=True)
 
-    json_file = elem_dir / 'marker_positions.json'
+    json_file = elem_dir / 'grid_locations.json'
     marker_data = {}  # Empty dictionary to store marker data
     with open(json_file, 'w') as f:
         json.dump(marker_data, f, indent=4)
     print("JSON file cleared and initialized")
+
+    def get_grid_section(x, y, frame_width, frame_height):
+        # Calculate grid section (1-9)
+        section_width = frame_width / 3
+        section_height = frame_height / 3
+        
+        grid_x = min(int(x / section_width), 2)
+        grid_y = min(int(y / section_height), 2)
+        
+        # Convert to 1-9 grid numbering (1 is top-left, 9 is bottom-right)
+        return grid_y * 3 + grid_x + 1
 
     try:
         while True:
@@ -64,58 +68,56 @@ def detect_aruco_markers():
             # Convert to grayscale if enabled
             if USE_GRAYSCALE:
                 processed_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2GRAY)
-                # Convert back to BGR for display purposes
                 display_frame = cv2.cvtColor(processed_frame, cv2.COLOR_GRAY2BGR)
             
             # Apply thresholding if enabled
             if USE_THRESHOLD:
-                if len(processed_frame.shape) == 3:  # If the frame is still in color
+                if len(processed_frame.shape) == 3:
                     gray_for_threshold = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2GRAY)
                 else:
                     gray_for_threshold = processed_frame
                 
-                # Apply threshold
                 _, processed_frame = cv2.threshold(gray_for_threshold, THRESHOLD_VALUE, 255, THRESHOLD_TYPE)
-                
-                # Convert back to BGR for display purposes
                 display_frame = cv2.cvtColor(processed_frame, cv2.COLOR_GRAY2BGR)
 
-            # Detect ArUco markers on the processed frame
+            # Detect ArUco markers
             corners, ids, rejected = detector.detectMarkers(processed_frame)
             
             current_time = time.time()
             
-            # If markers are detected and it's time to save (1 second interval)
+            # Draw grid lines
+            height, width = display_frame.shape[:2]
+            for i in range(1, 3):
+                # Vertical lines
+                cv2.line(display_frame, (width * i // 3, 0), (width * i // 3, height), (0, 255, 0), 2)
+                # Horizontal lines
+                cv2.line(display_frame, (0, height * i // 3), (width, height * i // 3), (0, 255, 0), 2)
+            
+            # If markers are detected and it's time to save
             if ids is not None and (current_time - last_save_time) >= save_interval:
                 # Draw markers on display frame
                 cv2.aruco.drawDetectedMarkers(display_frame, corners, ids)
                 
                 # Process each detected marker
                 for i in range(len(ids)):
-                    marker_id = str(ids[i][0])  # Convert to string for JSON key
+                    marker_id = str(ids[i][0])
                     
                     # Calculate marker center
                     marker_corners = corners[i][0]
                     center_x = int(np.mean([corner[0] for corner in marker_corners]))
                     center_y = int(np.mean([corner[1] for corner in marker_corners]))
                     
-                    # Update or create marker data
-                    if marker_id in marker_data:
-                        marker_data[marker_id]["position"]["x"] = center_x
-                        marker_data[marker_id]["position"]["y"] = center_y
-                        #marker_data[marker_id]["times_seen"] += 1
-                    else:
-                        marker_data[marker_id] = {
-                            "position": {
-                                "x": center_x,
-                                "y": center_y
-                            }#,
-                            #"times_seen": 1
-                        }
+                    # Get grid section
+                    grid_section = get_grid_section(center_x, center_y, width, height)
                     
-                    print(f"Marker {marker_id} updated - Position: ({center_x}, {center_y})") #, Times seen: {marker_data[marker_id]['times_seen']}
+                    # Update marker data only if section has changed
+                    if marker_id not in marker_data or marker_data[marker_id]["grid_section"] != grid_section:
+                        marker_data[marker_id] = {
+                            "grid_section": grid_section
+                        }
+                        print(f"Marker {marker_id} moved to grid section {grid_section}")
                 
-                # Save to JSON file once per second
+                # Save to JSON file
                 with open(json_file, 'w') as f:
                     json.dump(marker_data, f, indent=4)
                     
@@ -125,7 +127,7 @@ def detect_aruco_markers():
             elif ids is not None:
                 cv2.aruco.drawDetectedMarkers(display_frame, corners, ids)
 
-            # Add status text to display frame
+            # Add status text
             status_text = []
             if USE_GRAYSCALE:
                 status_text.append("Grayscale: ON")
@@ -139,7 +141,7 @@ def detect_aruco_markers():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             # Display the frame
-            cv2.imshow('ArUco Marker Detection', display_frame)
+            cv2.imshow('Grid ArUco Marker Detection', display_frame)
 
             # Break loop with 'q' key
             if cv2.waitKey(1) & 0xFF == ord('q'):

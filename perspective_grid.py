@@ -7,7 +7,7 @@ from pathlib import Path
 
 def detect_aruco_markers():
     # Configuration flags
-    USE_GRAYSCALE = True   # Set to True for grayscale conversion
+    USE_GRAYSCALE = False   # Set to True for grayscale conversion
     USE_THRESHOLD = False   # Set to True for thresholding
     THRESHOLD_VALUE = 0  # Threshold value (0-255)
     THRESHOLD_TYPE = cv2.THRESH_OTSU  # Threshold type
@@ -28,6 +28,24 @@ def detect_aruco_markers():
     # Set up ArUco dictionary
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
     parameters = cv2.aruco.DetectorParameters()
+    
+    # Default parameters with comments about which ones are most important to adjust
+    parameters.adaptiveThreshWinSizeMin = 3  # Default: 3
+    parameters.adaptiveThreshWinSizeMax = 23  # Default: 23
+    parameters.adaptiveThreshWinSizeStep = 10  # Default: 10
+    parameters.adaptiveThreshConstant = 7  # Default: 7 - Important: Controls threshold sensitivity
+    parameters.minMarkerPerimeterRate = 0.03  # Default: 0.03 - Important: Controls minimum marker size
+    parameters.maxMarkerPerimeterRate = 4.0  # Default: 4.0 - Important: Controls maximum marker size
+    parameters.polygonalApproxAccuracyRate = 0.03  # Default: 0.03
+    parameters.minCornerDistanceRate = 0.05  # Default: 0.05
+    parameters.minMarkerDistanceRate = 0.05  # Default: 0.05
+    parameters.minDistanceToBorder = 3  # Default: 3
+    parameters.minOtsuStdDev = 5.0  # Default: 5.0 - Important: Controls threshold sensitivity
+    parameters.perspectiveRemovePixelPerCell = 4  # Default: 4
+    parameters.perspectiveRemoveIgnoredMarginPerCell = 0.13  # Default: 0.13
+    parameters.maxErroneousBitsInBorderRate = 0.35  # Default: 0.35 - Important: Controls error tolerance
+    parameters.errorCorrectionRate = 0.5  # Default: 0.6 - Important: Controls error correction
+    
     detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
 
     # Initialize variables for timing
@@ -159,7 +177,8 @@ def detect_aruco_markers():
                 else:
                     gray_for_threshold = processed_frame
                 
-                _, processed_frame = cv2.threshold(gray_for_threshold, THRESHOLD_VALUE, 255, THRESHOLD_TYPE)
+                # Use Otsu's automatic thresholding
+                _, processed_frame = cv2.threshold(gray_for_threshold, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 display_frame = cv2.cvtColor(processed_frame, cv2.COLOR_GRAY2BGR)
 
             # Detect ArUco markers

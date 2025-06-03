@@ -17,7 +17,8 @@ from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from anthropic import Anthropic
-from elevenlabs import generate, save, set_api_key, voices
+from elevenlabs import stream
+from elevenlabs.client import ElevenLabs
 import pygame
 
 # Suppress ALSA warnings
@@ -42,7 +43,6 @@ with ALSAErrorSuppressor():
 # Load environment variables
 load_dotenv()
 anthropic = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
-set_api_key(os.getenv('ELEVENLABS_API_KEY'))
 
 # Create output directories if they don't exist
 AUDIO_OUTPUT_DIR = Path('audio_outputs')
@@ -55,7 +55,7 @@ TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 ELEM_DIR = Path('narrative_elements')
 ELEM_DIR.mkdir(exist_ok=True)
 
-MARKER_POSITIONS_FILE = ELEM_DIR / 'marker_positions.json'
+PERSPECTIVE_GRID_FILE = ELEM_DIR / 'perspective_grid_locations.json'
 PROTAGONISTS_FILE = ELEM_DIR / 'protagonists.json'
 ANTAGONISTS_FILE = ELEM_DIR / 'antagonists.json'
 GOALS_FILE = ELEM_DIR / 'goals.json'
@@ -84,7 +84,14 @@ GAME_STATES = [
 class QuantumTheater:
     def __init__(self):
         # Initialize pygame mixer for audio
-        pygame.mixer.init()
+        try:
+            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=4096)
+        except Exception as e:
+            print(f"Warning: Could not initialize audio system: {e}")
+            print("Audio playback may not work correctly.")
+        
+        # Set ElevenLabs API key
+        client = ElevenLabs(api_key=os.getenv('ELEVENLABS_API_KEY'))
         
         # Initialize speech recognition
         self.recognizer = sr.Recognizer()
@@ -104,7 +111,7 @@ class QuantumTheater:
         self.game_state = "setup"
         self.narrative = {}
         self.current_instruction = ""
-        self.marker_history = {}  # To track marker positions over time
+        self.marker_history = {}  # To track marker grid sections over time
         self.last_movement_check = time.time()
         self.movement_check_interval = 30.0  # seconds
         self.last_scenario_time = 0
@@ -153,8 +160,8 @@ class QuantumTheater:
         self.voice_volume = 0.8
         self.event_volume = 0.4
         
-        # Voice selection
-        self.voice_id = self.select_voice()
+        # # Voice selection
+        # self.voice_id = self.select_voice()
         
         # Transcript for logging
         self.transcript = []
@@ -239,186 +246,235 @@ class QuantumTheater:
             self.sound_effects[effect_name].play()
         else:
             print(f"Sound effect '{effect_name}' not found.")
-
-    def select_voice(self):
-        """Select a voice from the available ElevenLabs voices."""
-        try:
-            available_voices = voices()
-            if available_voices:
-                # Attempt to find a voice that sounds mystical or otherworldly
-                preferred_voices = ["Bella", "Onyx", "Nova", "Echo", "Wyvern", "Tempus"]
-                for voice_name in preferred_voices:
-                    for voice in available_voices:
-                        if voice_name.lower() in voice.name.lower():
-                            print(f"Selected voice: {voice.name}")
-                            return voice.voice_id
-                
-                # If no preferred voice is found, use a random voice
-                random_voice = random.choice(available_voices)
-                print(f"Selected random voice: {random_voice.name}")
-                return random_voice.voice_id
-            else:
-                print("No voices available. Using default voice.")
-                return None
-        except Exception as e:
-            print(f"Error selecting voice: {e}")
-            return None
     
     def get_current_markers(self):
         """Read current marker positions from the JSON file."""
         try:
-            with open(MARKER_POSITIONS_FILE, 'r') as f:
-                #print("loaded Marker JSON File")
+            with open(PERSPECTIVE_GRID_FILE, 'r') as f:
                 return json.load(f)
         except FileNotFoundError:
-            print(f"Warning: {MARKER_POSITIONS_FILE} not found.")
+            print(f"Warning: {PERSPECTIVE_GRID_FILE} not found.")
             return {}
         except json.JSONDecodeError:
-            print(f"Warning: {MARKER_POSITIONS_FILE} contains invalid JSON.")
+            print(f"Warning: {PERSPECTIVE_GRID_FILE} contains invalid JSON.")
             return {}
     
-    def calculate_distance(self, pos1, pos2):
-        """Calculate Euclidean distance between two positions."""
-        dx = pos1['x'] - pos2['x']
-        dy = pos1['y'] - pos2['y']
-        return math.sqrt(dx * dx + dy * dy)
+    def detect_marker_events(self):
+        """Detect new, removed, and moved markers based on grid section changes."""
+        current_markers = self.get_current_markers()
+        current_marker_ids = set(current_markers.keys())
+        previous_marker_ids = set(self.marker_history.keys())
+
+        # New markers
+        new_markers = current_marker_ids - previous_marker_ids
+        # Removed markers
+        removed_markers = previous_marker_ids - current_marker_ids
+        # Moved markers (grid section changed)
+        moved_markers = []
+        for marker_id in current_marker_ids & previous_marker_ids:
+            prev_section = self.marker_history[marker_id]
+            curr_section = current_markers[marker_id]["grid_section"]
+            if prev_section != curr_section:
+                moved_markers.append({
+                    "marker_id": marker_id,
+                    "from": prev_section,
+                    "to": curr_section
+                })
+        # Update marker_history for next check
+        self.marker_history = {marker_id: data["grid_section"] for marker_id, data in current_markers.items()}
+        return {
+            "current": current_markers,
+            "new": new_markers,
+            "removed": removed_markers,
+            "moved": moved_markers,
+            "has_changes": bool(new_markers or removed_markers or moved_markers)
+        }
+
+    def check_marker_arrangement(self):
+        """Check the current marker arrangement and potentially create a new narrative."""
+        marker_events = self.detect_marker_events()
+        current_time = time.time()
+
+        # Complete reset if all markers removed then new ones added
+        if len(marker_events["current"]) >= 3 and self.game_state == "setup":
+            # This is a fresh arrangement after clearing
+            print("\nDetected new marker arrangement after clearing. Initializing new narrative.")
+            return self.initialize_narrative()
+
+        # Check for marker movements if we have an active narrative
+        if self.game_state != "setup" and marker_events["moved"]:
+            self.handle_movement_response(marker_events["moved"])
+            return True
+
+        return False
     
-    def calculate_angle(self, pos1, pos2):
-        """Calculate the angle between two positions in degrees."""
-        dx = pos2['x'] - pos1['x']
-        dy = pos2['y'] - pos1['y']
-        angle_rad = math.atan2(dy, dx)
-        angle_deg = math.degrees(angle_rad)
-        return angle_deg
+    def create_marker_mapping_announcement(self):
+        """Create a text announcement of which marker IDs correspond to which narrative elements."""
+        mapping_parts = []
+        
+        # Create the announcement text
+        mapping_parts.append("Quantum markers calibrated.")
+        
+        # Add mappings for markers that are present
+        for marker_id, element_type in self.marker_mapping.items():
+            if marker_id in self.last_processed_markers and element_type in self.selected_elements:
+                element = self.selected_elements[element_type]
+                if element:
+                    mapping_parts.append(f"Marker {marker_id} resonates with {element['name']}.")
+        
+        # Add a note about interaction
+        mapping_parts.append("Arrange markers to influence the quantum narrative.")
+        
+        return " ".join(mapping_parts)
+
+    def initialize_narrative(self):
+        """Initialize a new narrative based on current marker positions."""
+        current_markers = self.get_current_markers()
+        
+        if not current_markers:
+            print("No markers detected. Please place some markers in view of the camera.")
+            return False
+        
+        print(f"\nInitializing narrative with {len(current_markers)} markers...")
+        
+        # Select elements for the narrative
+        self.selected_elements = self.select_narrative_elements(current_markers)
+        
+        # Reset narrative context
+        self.narrative_context = {
+            "recent_speech": [],
+            "recent_movements": [],
+            "phase_start_time": time.time(),
+            "total_movements": 0,
+            "last_state_change": time.time()
+        }
+        
+        # Create narrative description
+        self.narrative = self.create_narrative_description(self.selected_elements)
+        
+        # Update game state
+        self.game_state = "introduction"
+        self.last_scenario_time = time.time()
+        self.last_processed_markers = set(current_markers.keys())
+        
+        # Update marker history
+        for marker_id, data in current_markers.items():
+            self.marker_history[marker_id] = data["grid_section"]
+        
+        # Save the initial instruction
+        self.current_instruction = self.narrative.get("instructions", "")
+        
+        # Update transcript
+        self.transcript.append({
+            "type": "narrative_initialization",
+            "elements": {
+                "protagonist": self.selected_elements["protagonist"]["name"],
+                "antagonist": self.selected_elements["antagonist"]["name"],
+                "goal": self.selected_elements["goal"]["name"],
+                "setting": self.selected_elements["setting"]["name"],
+                "narrative_structure": self.selected_elements["narrative_structure"]["name"]
+            },
+            "speech_segments": self.narrative["speech_segments"],
+            "instructions": self.narrative.get("instructions", ""),
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Play initialization sound
+        self.play_sound_effect("initialize")
+        
+        # Play narrative segments
+        self.play_narrative_segments(self.narrative)
+        
+        print("\n=== New Quantum Narrative Initialized ===")
+        print(f"Narrative Structure: {self.selected_elements['narrative_structure']['name']}")
+        print(f"Protagonist: {self.selected_elements['protagonist']['name']}")
+        print(f"Antagonist: {self.selected_elements['antagonist']['name']}")
+        print(f"Goal: {self.selected_elements['goal']['name']}")
+        print(f"Setting: {self.selected_elements['setting']['name']}")
+        print(f"Tone: {self.selected_elements['tone']['name']}")
+        print("\nNarrative Speech:")
+        for segment in self.narrative["speech_segments"]:
+            print(segment)
+        if self.narrative.get("instructions"):
+            print("\nInstructions:")
+            print(self.narrative["instructions"])
+        print("===========================================")
+        
+        # Create a mapping message to announce which marker corresponds to which entity
+        marker_mapping_text = self.create_marker_mapping_announcement()
+        
+        # Play the mapping announcement after a short delay
+        time.sleep(2)
+        self.generate_and_play_audio(marker_mapping_text)
+        
+        return True
     
-    def calculate_marker_relationships(self, markers):
-        """Calculate spatial relationships between markers."""
-        relationships = []
-        
-        # Create a list of marker IDs for easier iteration
-        marker_ids = list(markers.keys())
-        
-        # If we have at least two markers, calculate distances and angles
-        if len(marker_ids) >= 2:
-            for i in range(len(marker_ids)):
-                for j in range(i+1, len(marker_ids)):
-                    id1, id2 = marker_ids[i], marker_ids[j]
-                    pos1 = markers[id1]['position']
-                    pos2 = markers[id2]['position']
-                    
-                    distance = self.calculate_distance(pos1, pos2)
-                    angle = self.calculate_angle(pos1, pos2)
-                    
-                    # Create a description of the relationship
-                    relationships.append({
-                        "marker1": id1,
-                        "marker2": id2,
-                        "distance": distance,
-                        "angle": angle,
-                        "description": f"Marker {id1} is {distance:.1f} units away from marker {id2} at an angle of {angle:.1f} degrees."
-                    })
-        
-        return relationships
-    
-    def detect_significant_patterns(self, markers, relationships):
-        """Detect significant patterns in marker arrangements."""
-        print("looking for patterns")
-        patterns = []
-        
-        # Check for markers in close proximity (potential interaction)
-        close_markers = []
-        for rel in relationships:
-            if rel["distance"] < 50:  # Adjust threshold as needed
-                close_markers.append((rel["marker1"], rel["marker2"]))
-                patterns.append(f"Markers {rel['marker1']} and {rel['marker2']} are in close proximity.")
-        
-        # Check for markers forming geometric shapes
-        if len(markers) >= 3:
-            # Simple triangle detection
-            triangles = []
-            marker_ids = list(markers.keys())
-            for i in range(len(marker_ids)):
-                for j in range(i+1, len(marker_ids)):
-                    for k in range(j+1, len(marker_ids)):
-                        id1, id2, id3 = marker_ids[i], marker_ids[j], marker_ids[k]
-                        triangles.append((id1, id2, id3))
-                        patterns.append(f"Markers {id1}, {id2}, and {id3} form a triangle.")
-        
-        # Check for markers in specific zones
-        for marker_id, data in markers.items():
-            x, y = data['position']['x'], data['position']['y']
-            if x < 200 and y < 200:
-                patterns.append(f"Marker {marker_id} is in the upper-left quadrant.")
-            elif x >= 200 and y < 200:
-                patterns.append(f"Marker {marker_id} is in the upper-right quadrant.")
-            elif x < 200 and y >= 200:
-                patterns.append(f"Marker {marker_id} is in the lower-left quadrant.")
-            else:
-                patterns.append(f"Marker {marker_id} is in the lower-right quadrant.")
-        
-        # Check for linear arrangements
-        if len(markers) >= 3:
-            marker_ids = list(markers.keys())
-            for i in range(len(marker_ids) - 2):
-                for j in range(i + 1, len(marker_ids) - 1):
-                    for k in range(j + 1, len(marker_ids)):
-                        id1, id2, id3 = marker_ids[i], marker_ids[j], marker_ids[k]
-                        pos1 = markers[id1]['position']
-                        pos2 = markers[id2]['position']
-                        pos3 = markers[id3]['position']
-                        
-                        # Calculate slopes between the points
-                        try:
-                            slope1 = (pos2['y'] - pos1['y']) / (pos2['x'] - pos1['x'])
-                            slope2 = (pos3['y'] - pos2['y']) / (pos3['x'] - pos2['x'])
-                            
-                            # If slopes are very close, points are approximately colinear
-                            if abs(slope1 - slope2) < 0.1:
-                                patterns.append(f"Markers {id1}, {id2}, and {id3} form a line.")
-                        except ZeroDivisionError:
-                            # Handle vertical lines
-                            if abs(pos1['x'] - pos2['x']) < 5 and abs(pos2['x'] - pos3['x']) < 5:
-                                patterns.append(f"Markers {id1}, {id2}, and {id3} form a vertical line.")
-        
-        # Check for circular arrangements
-        if len(markers) >= 3:
-            marker_ids = list(markers.keys())
-            positions = [markers[marker_id]['position'] for marker_id in marker_ids]
+    def save_transcript(self):
+        """Save the current session transcript to a file."""
+        try:
+            # Create a timestamp for the filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            transcript_file = TRANSCRIPTS_DIR / f"quantum_theater_session_{timestamp}.json"
             
-            # Calculate center of mass
-            center_x = sum(pos['x'] for pos in positions) / len(positions)
-            center_y = sum(pos['y'] for pos in positions) / len(positions)
-            center = {'x': center_x, 'y': center_y}
+            # Prepare transcript data
+            transcript_data = {
+                "session_info": {
+                    "start_time": self.transcript[0]["timestamp"] if self.transcript else None,
+                    "end_time": datetime.now().isoformat(),
+                    "game_states": self.completed_phases,
+                    "final_state": self.game_state
+                },
+                "narrative_elements": {
+                    "protagonist": self.selected_elements["protagonist"]["name"] if self.selected_elements["protagonist"] else None,
+                    "antagonist": self.selected_elements["antagonist"]["name"] if self.selected_elements["antagonist"] else None,
+                    "goal": self.selected_elements["goal"]["name"] if self.selected_elements["goal"] else None,
+                    "setting": self.selected_elements["setting"]["name"] if self.selected_elements["setting"] else None,
+                    "narrative_structure": self.selected_elements["narrative_structure"]["name"] if self.selected_elements["narrative_structure"] else None
+                },
+                "transcript": self.transcript
+            }
             
-            # Calculate distances from center
-            distances = [self.calculate_distance(pos, center) for pos in positions]
-            avg_distance = sum(distances) / len(distances)
+            # Save to file
+            with open(transcript_file, 'w') as f:
+                json.dump(transcript_data, f, indent=2)
             
-            # If all points are roughly equidistant from center, they form a circle
-            if all(abs(dist - avg_distance) < 15 for dist in distances):
-                patterns.append(f"The markers form a circular arrangement.")
+            print(f"\nSession transcript saved to: {transcript_file}")
+            
+        except Exception as e:
+            print(f"Error saving transcript: {e}")
+            traceback.print_exc()
+
+    def run(self):
+        """Run the main game loop."""
+        print("\n=== Quantum Theater .0 ===")
+        print("Place markers in view of the camera to initialize a quantum narrative.")
+        print("Say 'Oracle help' or 'Oracle clue' to get a hint (5 available).")
+        print("Say 'Oracle progress' to advance the narrative when ready.")
+        print("Say 'Oracle exit' or 'Oracle quit' to end the session.")
+        print("==============================\n")
         
-        return patterns
-    
-    def select_narrative_elements(self, markers, relationships, patterns):
-        """Select narrative elements randomly from available options."""
-        selected = self.selected_elements.copy()
+        # Start voice listener thread
+        voice_thread = threading.Thread(target=self.voice_listener_thread, daemon=True)
+        voice_thread.start()
         
-        # Select elements randomly from each category
-        selected["narrative_structure"] = random.choice(self.narrative_structures_data["structures"])
-        selected["protagonist"] = random.choice(random.choice(self.protagonists_data["archetypes"])["protagonists"])
-        selected["antagonist"] = random.choice(random.choice(self.antagonists_data["categories"])["antagonists"])
-        selected["goal"] = random.choice(random.choice(self.goals_data["categories"])["goals"])
-        selected["obstacle"] = random.choice(random.choice(self.obstacles_data["categories"])["obstacles"])
-        selected["world_rule"] = random.choice(random.choice(self.world_rules_data["categories"])["rules"])
-        selected["supporting_role"] = random.choice(random.choice(self.supporting_roles_data["categories"])["roles"])
-        selected["setting"] = random.choice(random.choice(self.settings_data["categories"])["settings"])
-        selected["time_dynamic"] = random.choice(random.choice(self.time_dynamics_data["categories"])["dynamics"])
-        selected["agency_mechanic"] = random.choice(random.choice(self.agency_data["categories"])["mechanics"])
-        selected["transformation"] = random.choice(random.choice(self.transformations_data["categories"])["transformations"])
-        selected["tone"] = random.choice(random.choice(self.tone_data["categories"])["tones"])
+        # Set up initial tracking
+        self.current_phase_start_time = time.time()
         
-        return selected
+        try:
+            while True:
+                # Check for marker changes and update narrative if needed
+                self.check_marker_arrangement()
+                
+                # Short delay to prevent maxing CPU
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            print("\nProgram interrupted. Saving transcript and exiting...")
+            self.save_transcript()
+        finally:
+            # Clean up pygame mixer
+            pygame.mixer.quit()
+            print("\nQuantum Theater session ended.")
     
     def update_narrative_context(self, speech_segments=None, movement=None):
         """Update the narrative context with new information."""
@@ -457,12 +513,32 @@ class QuantumTheater:
                 element_type = self.marker_mapping.get(marker_id, "unknown")
                 if element_type in self.selected_elements:
                     element = self.selected_elements[element_type]
-                    context_parts.append(f"- {element['name']} moved {movement['distance']:.1f} units")
+                    context_parts.append(f"- {element['name']} moved from grid section {movement['from']} to {movement['to']}")
         
         # Add total movement count
         context_parts.append(f"\nTotal movements in this phase: {self.narrative_context['total_movements']}")
         
         return "\n".join(context_parts)
+
+    def select_narrative_elements(self, markers):
+        """Select narrative elements randomly from available options."""
+        selected = self.selected_elements.copy()
+        
+        # Select elements randomly from each category
+        selected["narrative_structure"] = random.choice(self.narrative_structures_data["structures"])
+        selected["protagonist"] = random.choice(random.choice(self.protagonists_data["archetypes"])["protagonists"])
+        selected["antagonist"] = random.choice(random.choice(self.antagonists_data["categories"])["antagonists"])
+        selected["goal"] = random.choice(random.choice(self.goals_data["categories"])["goals"])
+        selected["obstacle"] = random.choice(random.choice(self.obstacles_data["categories"])["obstacles"])
+        selected["world_rule"] = random.choice(random.choice(self.world_rules_data["categories"])["rules"])
+        selected["supporting_role"] = random.choice(random.choice(self.supporting_roles_data["categories"])["roles"])
+        selected["setting"] = random.choice(random.choice(self.settings_data["categories"])["settings"])
+        selected["time_dynamic"] = random.choice(random.choice(self.time_dynamics_data["categories"])["dynamics"])
+        selected["agency_mechanic"] = random.choice(random.choice(self.agency_data["categories"])["mechanics"])
+        selected["transformation"] = random.choice(random.choice(self.transformations_data["categories"])["transformations"])
+        selected["tone"] = random.choice(random.choice(self.tone_data["categories"])["tones"])
+        
+        return selected
 
     def create_narrative_description(self, selected_elements, stage="introduction"):
         """Create a narrative description based on the selected elements and game stage."""
@@ -712,141 +788,105 @@ Otherwise, continue the resolution and include <next_state>false</next_state>.""
                 "full_response": ""
             }
 
-    def check_state_advancement(self, narrative_response):
-        """Check if the current game state should advance based on Claude's assessment."""
-        if narrative_response.get("next_state", False):
-            current_index = GAME_STATES.index(self.game_state)
-            if current_index < len(GAME_STATES) - 1:
-                previous_state = self.game_state
-                self.game_state = GAME_STATES[current_index + 1]
-                
-                print(f"\nAdvancing from {previous_state} to {self.game_state}")
-                
-                # Update narrative context for state change
-                self.narrative_context["last_state_change"] = time.time()
-                self.narrative_context["phase_start_time"] = time.time()
-                self.narrative_context["total_movements"] = 0
-                
-                # Play a state transition sound
-                self.play_sound_effect("transition")
-                
-                # Generate narrative for the new state
-                new_narrative = self.create_narrative_description(self.selected_elements, stage=self.game_state)
+    def handle_movement_response(self, movements):
+        """Generate and play a response to marker movements."""
+        if not movements:
+            return
+        
+        # Don't respond to movements during audio playback
+        if self.audio_playing:
+            return
+        
+        print(f"\nResponding to {len(movements)} marker movements...")
+        
+        # Play movement sound
+        self.play_sound_effect("movement")
+        
+        # Create a description of the movement in terms of narrative elements
+        movement_description = []
+        for movement in movements:
+            marker_id = movement["marker_id"]
+            if marker_id in self.marker_mapping:
+                element_type = self.marker_mapping[marker_id]
+                if element_type in self.selected_elements:
+                    element = self.selected_elements[element_type]
+                    movement_description.append(f"{element['name']} has moved from grid section {movement['from']} to {movement['to']}.")
+        
+        # Update narrative context with the movement
+        self.update_narrative_context(movement=movements[0])  # Use the first movement for context
+        
+        # The response depends on the current game state
+        if self.game_state == "introduction":
+            # In introduction, movement advances to exploration
+            narrative_response = self.create_narrative_description(self.selected_elements, stage=self.game_state)
+            state_change = self.check_state_advancement(narrative_response)
+            if state_change:
+                return state_change
+        elif self.game_state in ["exploration", "climax"]:
+            # In exploration or climax, movements develop the narrative
+            narrative_response = self.create_narrative_description(self.selected_elements, stage=self.game_state)
                 
                 # Update transcript
-                self.transcript.append({
-                    "type": "state_transition",
-                    "from_state": previous_state,
-                    "to_state": self.game_state,
-                    "narrative": new_narrative["speech_segments"][0],
+            self.transcript.append({
+                "type": "movement_response",
+                "game_state": self.game_state,
+                "movements": [{"marker_id": m["marker_id"], "from": m["from"], "to": m["to"]} for m in movements],
+                "movement_description": movement_description,
+                "gm_response": narrative_response["speech_segments"][0],
                     "timestamp": datetime.now().isoformat()
                 })
                 
                 # Play narrative segments
-                self.play_narrative_segments(new_narrative)
-                
-                return {
-                    "type": "state_transition",
-                    "from_state": previous_state,
-                    "to_state": self.game_state,
-                    "text": new_narrative["speech_segments"][0]
-                }
+            self.play_narrative_segments(narrative_response)
+            
+            print("\n--- Response to Movement ---")
+            for segment in narrative_response["speech_segments"]:
+                print(segment)
+            
+            # Check for state advancement
+            state_change = self.check_state_advancement(narrative_response)
+            if state_change:
+                return state_change
         
-        return None
+        elif self.game_state == "collapse":
+            # In collapse phase, significant movement leads to resolution
+            narrative_response = self.create_narrative_description(self.selected_elements, stage="collapse")
+            
+            # Update transcript
+            self.transcript.append({
+                "type": "movement_response",
+                "game_state": self.game_state,
+                "movements": [{"marker_id": m["marker_id"], "from": m["from"], "to": m["to"]} for m in movements],
+                "movement_description": movement_description,
+                "gm_response": narrative_response["speech_segments"][0],
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            # Play narrative segments
+            self.play_narrative_segments(narrative_response)
+            
+            # Check for state advancement
+            state_change = self.check_state_advancement(narrative_response)
+            if state_change:
+                return state_change
     
-    def detect_marker_changes(self):
-        """Detect changes in markers from the last check."""
-        current_markers = self.get_current_markers()
-        current_marker_ids = set(current_markers.keys())
-        
-        # Check for new markers
-        new_markers = current_marker_ids - self.last_processed_markers
-        
-        # Check for removed markers
-        removed_markers = self.last_processed_markers - current_marker_ids
-        
-        # Update last processed markers
-        self.last_processed_markers = current_marker_ids
-        
-        return {
-            "current": current_markers,
-            "new": new_markers,
-            "removed": removed_markers,
-            "has_changes": bool(new_markers or removed_markers)
-        }
-    
-    def detect_significant_movements(self):
-        """Detect significant movements in marker positions."""
-        current_markers = self.get_current_markers()
-        significant_movements = []
-        
-        for marker_id, data in current_markers.items():
-            current_pos = data['position']
+    def voice_listener_thread(self):
+        """Background thread to continuously listen for voice commands."""
+        while True:
+            # Only listen when not playing audio
+            if not self.audio_playing:
+                command = self.listen_for_command()
+                if command:
+                    with self.lock:
+                        print(f"\nProcessing command: {command}")
+                        result = self.handle_voice_command(command)
+                        
+                        if result and result["type"] == "exit":
+                            self.save_transcript()
+                            break
             
-            # Check if we've seen this marker before
-            if marker_id in self.marker_history:
-                previous_pos = self.marker_history[marker_id]['position']
-                distance = self.calculate_distance(current_pos, previous_pos)
-                
-                # If movement exceeds threshold, record it
-                if distance > 20:  # Adjust threshold as needed
-                    significant_movements.append({
-                        "marker_id": marker_id,
-                        "from": previous_pos,
-                        "to": current_pos,
-                        "distance": distance
-                    })
-            
-            # Update marker history
-            self.marker_history[marker_id] = data
-        
-        return significant_movements
-    
-    def generate_and_play_audio(self, text):
-        """Generate and play audio using ElevenLabs API."""
-        if not text:
-            print("No text to generate audio for.")
-            return
-        
-        try:
-            print(f"\nGenerating audio for: {text}")
-            
-            # Set audio playing flag
-            self.audio_playing = True
-            
-            # Generate audio
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            audio = generate(
-                text=text,
-                voice=self.voice_id,
-                model="eleven_monolingual_v1"
-            )
-            
-            # Save the audio file
-            audio_filename = f"quantum_narrative_{timestamp}.mp3"
-            audio_path = str(AUDIO_OUTPUT_DIR / audio_filename)
-            save(audio, audio_path)
-            print(f"Saved audio file: {audio_filename}")
-            
-            # Play the audio file
-            pygame.mixer.music.load(audio_path)
-            pygame.mixer.music.set_volume(self.voice_volume)
-            pygame.mixer.music.play()
-            
-            # Wait for the audio to finish playing
-            while pygame.mixer.music.get_busy():
-                pygame.time.Clock().tick(10)
-            
-            # Reset audio playing flag
-            self.audio_playing = False
-                
-            return audio_path
-            
-        except Exception as e:
-            print(f"Error generating or playing audio: {e}")
-            traceback.print_exc()
-            self.audio_playing = False
+            # Short delay to prevent maxing CPU
+            time.sleep(0.1)
     
     def listen_for_command(self):
         """Listen for voice commands with trigger word."""
@@ -1036,394 +1076,72 @@ Current narrative state:
                 "text": speech
             }
     
-    def handle_movement_response(self, movements):
-        """Generate and play a response to marker movements."""
-        if not movements:
-            return
-        
-        # Don't respond to movements during audio playback
-        if self.audio_playing:
-            return
-        
-        print(f"\nResponding to {len(movements)} marker movements...")
-        
-        # Play movement sound
-        self.play_sound_effect("movement")
-        
-        # Create a description of the movement in terms of narrative elements
-        movement_description = []
-        for movement in movements:
-            marker_id = movement["marker_id"]
-            if marker_id in self.marker_mapping:
-                element_type = self.marker_mapping[marker_id]
-                if element_type in self.selected_elements:
-                    element = self.selected_elements[element_type]
-                    movement_description.append(f"{element['name']} has moved {movement['distance']:.1f} units.")
-        
-        # Update narrative context with the movement
-        self.update_narrative_context(movement=movements[0])  # Use the first movement for context
-        
-        # The response depends on the current game state
-        if self.game_state == "introduction":
-            # In introduction, movement advances to exploration
-            narrative_response = self.create_narrative_description(self.selected_elements, stage=self.game_state)
-            state_change = self.check_state_advancement(narrative_response)
-            if state_change:
-                return state_change
-        elif self.game_state in ["exploration", "climax"]:
-            # In exploration or climax, movements develop the narrative
-            narrative_response = self.create_narrative_description(self.selected_elements, stage=self.game_state)
+    def check_state_advancement(self, narrative_response):
+        """Check if the current game state should advance based on Claude's assessment."""
+        if narrative_response.get("next_state", False):
+            current_index = GAME_STATES.index(self.game_state)
+            if current_index < len(GAME_STATES) - 1:
+                previous_state = self.game_state
+                self.game_state = GAME_STATES[current_index + 1]
+                
+                print(f"\nAdvancing from {previous_state} to {self.game_state}")
+                
+                # Update narrative context for state change
+                self.narrative_context["last_state_change"] = time.time()
+                self.narrative_context["phase_start_time"] = time.time()
+                self.narrative_context["total_movements"] = 0
+                
+                # Play a state transition sound
+                self.play_sound_effect("transition")
+                
+                # Generate narrative for the new state
+                new_narrative = self.create_narrative_description(self.selected_elements, stage=self.game_state)
             
             # Update transcript
             self.transcript.append({
-                "type": "movement_response",
-                "game_state": self.game_state,
-                "movements": [{"marker_id": m["marker_id"], "distance": m["distance"]} for m in movements],
-                "movement_description": movement_description,
-                "gm_response": narrative_response["speech_segments"][0],
+                    "type": "state_transition",
+                    "from_state": previous_state,
+                    "to_state": self.game_state,
+                    "narrative": new_narrative["speech_segments"][0],
                 "timestamp": datetime.now().isoformat()
             })
             
             # Play narrative segments
-            self.play_narrative_segments(narrative_response)
-            
-            print("\n--- Response to Movement ---")
-            for segment in narrative_response["speech_segments"]:
-                print(segment)
-            
-            # Check for state advancement
-            state_change = self.check_state_advancement(narrative_response)
-            if state_change:
-                return state_change
+            self.play_narrative_segments(new_narrative)
+                
+            return {
+                    "type": "state_transition",
+                    "from_state": previous_state,
+                    "to_state": self.game_state,
+                    "text": new_narrative["speech_segments"][0]
+                }
         
-        elif self.game_state == "collapse":
-            # In collapse phase, significant movement leads to resolution
-            narrative_response = self.create_narrative_description(self.selected_elements, stage="collapse")
-            
-            # Update transcript
-            self.transcript.append({
-                "type": "movement_response",
-                "game_state": self.game_state,
-                "movements": [{"marker_id": m["marker_id"], "distance": m["distance"]} for m in movements],
-                "movement_description": movement_description,
-                "gm_response": narrative_response["speech_segments"][0],
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            # Play narrative segments
-            self.play_narrative_segments(narrative_response)
-            
-            # Check for state advancement
-            state_change = self.check_state_advancement(narrative_response)
-            if state_change:
-                return state_change
-    
-    def voice_listener_thread(self):
-        """Background thread to continuously listen for voice commands."""
-        while True:
-            # Only listen when not playing audio
-            if not self.audio_playing:
-                command = self.listen_for_command()
-                if command:
-                    with self.lock:
-                        print(f"\nProcessing command: {command}")
-                        result = self.handle_voice_command(command)
-                        
-                        if result and result["type"] == "exit":
-                            self.save_transcript()
-                            break
-            
-            # Short delay to prevent maxing CPU
-            time.sleep(0.1)
-    
-    def check_marker_arrangement(self):
-        """Check the current marker arrangement and potentially create a new narrative."""
-        marker_changes = self.detect_marker_changes()
-        current_time = time.time()
-        
-        # Complete reset if all markers removed then new ones added
-        if len(marker_changes["current"]) >= 3 and self.game_state == "setup":
-            # This is a fresh arrangement after clearing
-            print("\nDetected new marker arrangement after clearing. Initializing new narrative.")
-            return self.initialize_narrative()
-            
-        # Check for significant movements if we have an active narrative
-        if self.game_state != "setup" and current_time - self.last_movement_check >= self.movement_check_interval:
-            movements = self.detect_significant_movements()
-            self.last_movement_check = current_time
-            
-            if movements:
-                self.handle_movement_response(movements)
-                return True
-        
-        return False
-    
-    def create_marker_mapping_announcement(self):
-        """Create a text announcement of which marker IDs correspond to which narrative elements."""
-        mapping_parts = []
-        
-        # Create the announcement text
-        mapping_parts.append("Quantum markers calibrated.")
-        
-        # Add mappings for markers that are present
-        for marker_id, element_type in self.marker_mapping.items():
-            if marker_id in self.last_processed_markers and element_type in self.selected_elements:
-                element = self.selected_elements[element_type]
-                if element:
-                    mapping_parts.append(f"Marker {marker_id} resonates with {element['name']}.")
-        
-        # Add a note about interaction
-        mapping_parts.append("Arrange markers to influence the quantum narrative.")
-        
-        return " ".join(mapping_parts)
+            return None
 
-    def generate_location(self):
-        """Generate a specific location within the current setting based on the goal and narrative elements."""
-        if not self.selected_elements["setting"] or not self.selected_elements["goal"]:
+    def generate_and_play_audio(self, text):
+        """Generate and play audio using ElevenLabs API."""
+        if not text:
+            print("No text to generate audio for.")
             return None
             
-        setting = self.selected_elements["setting"]
-        goal = self.selected_elements["goal"]
-        
-        # Create a prompt for Claude to generate a location
-        prompt = f"""Based on the following setting and goal, generate a specific location that would be relevant to the narrative:
-
-SETTING:
-{setting['name']}: {setting['description']}
-Properties: {', '.join(setting['properties'][:2])}
-
-GOAL:
-{goal['name']}: {goal['description']}
-Challenges: {', '.join(goal['challenges'][:2])}
-
-Generate a specific location that:
-1. Fits within the setting
-2. Is relevant to achieving the goal
-3. Has interesting properties that could affect the narrative
-4. Could serve as a meaningful space for character interaction
-
-Format your response as:
-<name>Location Name</name>
-<description>Detailed description of the location</description>
-<properties>Property 1, Property 2, Property 3</properties>
-<significance>Why this location matters to the goal</significance>"""
-        
         try:
-            message = anthropic.messages.create(
-                model="claude-3-7-sonnet-20250219",
-                max_tokens=500,
-                temperature=0.7,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ]
+            print(f"\nGenerating audio for: {text}")
+            self.audio_playing = True
+
+            # Generate audio
+            audio_stream = client.text_to_speech.stream(
+                text=text,
+                voice_id="onwK4e9ZLuTAKqWW03F9",  # Replace with the desired voice ID
+                model_id="eleven_multilingual_v2" # Replace with the desired model ID
             )
             
-            response = message.content[0].text
-            
-            # Parse the response
-            location = {
-                "name": "",
-                "description": "",
-                "properties": [],
-                "significance": ""
-            }
-            
-            if "<name>" in response and "</name>" in response:
-                location["name"] = response.split("<name>")[1].split("</name>")[0].strip()
-            
-            if "<description>" in response and "</description>" in response:
-                location["description"] = response.split("<description>")[1].split("</description>")[0].strip()
-            
-            if "<properties>" in response and "</properties>" in response:
-                properties = response.split("<properties>")[1].split("</properties>")[0].strip()
-                location["properties"] = [p.strip() for p in properties.split(",")]
-            
-            if "<significance>" in response and "</significance>" in response:
-                location["significance"] = response.split("<significance>")[1].split("</significance>")[0].strip()
-            
-            return location
-            
-        except Exception as e:
-            print(f"Error generating location: {e}")
-            return None
-
-    def play_narrative_segments(self, narrative_response):
-        """Play narrative segments with appropriate pauses between them."""
-        if not narrative_response.get("speech_segments"):
+            stream(audio_stream)
             return
         
-        # Play each speech segment with a pause between them
-        for segment in narrative_response["speech_segments"]:
-            self.generate_and_play_audio(segment)
-            time.sleep(0.5)  # Short pause between segments
-        
-        # Play instructions if they exist
-        if narrative_response.get("instructions"):
-            time.sleep(1.0)  # Longer pause before instructions
-            self.generate_and_play_audio(narrative_response["instructions"])
-
-    def initialize_narrative(self):
-        """Initialize a new narrative based on current marker positions."""
-        current_markers = self.get_current_markers()
-        
-        if not current_markers:
-            print("No markers detected. Please place some markers in view of the camera.")
-            return False
-        
-        print(f"\nInitializing narrative with {len(current_markers)} markers...")
-        
-        # Calculate relationships and patterns
-        relationships = self.calculate_marker_relationships(current_markers)
-        patterns = self.detect_significant_patterns(current_markers, relationships)
-        
-        # Select elements for the narrative
-        self.selected_elements = self.select_narrative_elements(current_markers, relationships, patterns)
-        
-        # Generate a specific location within the setting
-        self.selected_elements["location"] = self.generate_location()
-        
-        # Reset narrative context
-        self.narrative_context = {
-            "recent_speech": [],
-            "recent_movements": [],
-            "phase_start_time": time.time(),
-            "total_movements": 0,
-            "last_state_change": time.time()
-        }
-        
-        # Create narrative description
-        self.narrative = self.create_narrative_description(self.selected_elements)
-        
-        # Update game state
-        self.game_state = "introduction"
-        self.last_scenario_time = time.time()
-        self.last_processed_markers = set(current_markers.keys())
-        
-        # Update marker history
-        for marker_id, data in current_markers.items():
-            self.marker_history[marker_id] = data
-        
-        # Save the initial instruction
-        self.current_instruction = self.narrative.get("instructions", "")
-        
-        # Update transcript
-        self.transcript.append({
-            "type": "narrative_initialization",
-            "elements": {
-                "protagonist": self.selected_elements["protagonist"]["name"],
-                "antagonist": self.selected_elements["antagonist"]["name"],
-                "goal": self.selected_elements["goal"]["name"],
-                "setting": self.selected_elements["setting"]["name"],
-                "location": self.selected_elements["location"]["name"] if self.selected_elements["location"] else None,
-                "narrative_structure": self.selected_elements["narrative_structure"]["name"]
-            },
-            "speech_segments": self.narrative["speech_segments"],
-            "instructions": self.narrative.get("instructions", ""),
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        # Play initialization sound
-        self.play_sound_effect("initialize")
-        
-        # Play narrative segments
-        self.play_narrative_segments(self.narrative)
-        
-        print("\n=== New Quantum Narrative Initialized ===")
-        print(f"Narrative Structure: {self.selected_elements['narrative_structure']['name']}")
-        print(f"Protagonist: {self.selected_elements['protagonist']['name']}")
-        print(f"Antagonist: {self.selected_elements['antagonist']['name']}")
-        print(f"Goal: {self.selected_elements['goal']['name']}")
-        print(f"Setting: {self.selected_elements['setting']['name']}")
-        if self.selected_elements["location"]:
-            print(f"Location: {self.selected_elements['location']['name']}")
-        print(f"Tone: {self.selected_elements['tone']['name']}")
-        print("\nNarrative Speech:")
-        for segment in self.narrative["speech_segments"]:
-            print(segment)
-        if self.narrative.get("instructions"):
-            print("\nInstructions:")
-            print(self.narrative["instructions"])
-        print("===========================================")
-        
-        # Create a mapping message to announce which marker corresponds to which entity
-        marker_mapping_text = self.create_marker_mapping_announcement()
-        
-        # Play the mapping announcement after a short delay
-        time.sleep(2)
-        self.generate_and_play_audio(marker_mapping_text)
-        
-        return True
-    
-    def save_transcript(self):
-        """Save the current session transcript to a file."""
-        try:
-            # Create a timestamp for the filename
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            transcript_file = TRANSCRIPTS_DIR / f"quantum_theater_session_{timestamp}.json"
-            
-            # Prepare transcript data
-            transcript_data = {
-                "session_info": {
-                    "start_time": self.transcript[0]["timestamp"] if self.transcript else None,
-                    "end_time": datetime.now().isoformat(),
-                    "game_states": self.completed_phases,
-                    "final_state": self.game_state
-                },
-                "narrative_elements": {
-                    "protagonist": self.selected_elements["protagonist"]["name"] if self.selected_elements["protagonist"] else None,
-                    "antagonist": self.selected_elements["antagonist"]["name"] if self.selected_elements["antagonist"] else None,
-                    "goal": self.selected_elements["goal"]["name"] if self.selected_elements["goal"] else None,
-                    "setting": self.selected_elements["setting"]["name"] if self.selected_elements["setting"] else None,
-                    "location": self.selected_elements["location"]["name"] if self.selected_elements["location"] else None,
-                    "narrative_structure": self.selected_elements["narrative_structure"]["name"] if self.selected_elements["narrative_structure"] else None
-                },
-                "transcript": self.transcript
-            }
-            
-            # Save to file
-            with open(transcript_file, 'w') as f:
-                json.dump(transcript_data, f, indent=2)
-            
-            print(f"\nSession transcript saved to: {transcript_file}")
-            
         except Exception as e:
-            print(f"Error saving transcript: {e}")
-            traceback.print_exc()
-
-    def run(self):
-        """Run the main game loop."""
-        print("\n=== Quantum Theater .0 ===")
-        print("Place markers in view of the camera to initialize a quantum narrative.")
-        print("Say 'Oracle help' or 'Oracle clue' to get a hint (5 available).")
-        print("Say 'Oracle progress' to advance the narrative when ready.")
-        print("Say 'Oracle exit' or 'Oracle quit' to end the session.")
-        print("==============================\n")
-        
-        # Start voice listener thread
-        voice_thread = threading.Thread(target=self.voice_listener_thread, daemon=True)
-        voice_thread.start()
-        
-        # Set up initial tracking
-        self.current_phase_start_time = time.time()
-        
-        try:
-            while True:
-                # Check for marker changes and update narrative if needed
-                self.check_marker_arrangement()
-                
-                # Short delay to prevent maxing CPU
-                time.sleep(1)
-                
-        except KeyboardInterrupt:
-            print("\nProgram interrupted. Saving transcript and exiting...")
-            self.save_transcript()
-        finally:
-            # Clean up pygame mixer
-            pygame.mixer.quit()
-            print("\nQuantum Theater session ended.")
+            print(f"Error generating or playing audio: {e}")
+            return None
+            
 
 def main():
     """Main entry point for the Quantum Theater .0 program."""

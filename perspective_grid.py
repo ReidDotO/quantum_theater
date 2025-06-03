@@ -13,7 +13,7 @@ def detect_aruco_markers():
     THRESHOLD_TYPE = cv2.THRESH_OTSU  # Threshold type
     
     # Reference marker IDs for grid corners (in order: top-left, top-right, bottom-left, bottom-right)
-    REFERENCE_MARKERS = [67, 74, 62, 79]
+    REFERENCE_MARKERS = [74, 79, 62, 67]
     
     # Initialize the camera
     cap = cv2.VideoCapture(1)

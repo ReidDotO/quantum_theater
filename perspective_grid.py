@@ -56,6 +56,10 @@ def detect_aruco_markers():
     marker_memory = {}  # Store last seen positions of reference markers
     memory_timeout = 90.0  # How long to remember markers (seconds)
     
+    # Non-corner marker memory system
+    non_corner_marker_memory = {}  # Store last seen positions of non-corner markers
+    non_corner_memory_timeout = 10.0  # How long to remember non-corner markers (seconds)
+    
     # Create narrative_elements directory if it doesn't exist
     elem_dir = Path('narrative_elements')
     elem_dir.mkdir(exist_ok=True)
@@ -78,6 +82,41 @@ def detect_aruco_markers():
         # Convert to 1-12 grid numbering (1 is top-left, 12 is bottom-right)
         # Row 1: 1,2,3,4 | Row 2: 5,6,7,8 | Row 3: 9,10,11,12
         return grid_y * 4 + grid_x + 1
+
+    def update_non_corner_marker_memory(ids, corners, current_time):
+        """
+        Update memory for non-corner markers with 10-second timeout
+        """
+        if ids is not None:
+            for i, marker_id in enumerate(ids):
+                if marker_id[0] not in REFERENCE_MARKERS:  # Skip reference markers
+                    marker_corners = corners[i][0]
+                    center_x = np.mean([corner[0] for corner in marker_corners])
+                    center_y = np.mean([corner[1] for corner in marker_corners])
+                    
+                    non_corner_marker_memory[marker_id[0]] = {
+                        'center': (center_x, center_y),
+                        'corners': marker_corners.copy(),
+                        'timestamp': current_time
+                    }
+        
+        # Clean up old non-corner marker memory
+        for marker_id in list(non_corner_marker_memory.keys()):
+            if current_time - non_corner_marker_memory[marker_id]['timestamp'] > non_corner_memory_timeout:
+                del non_corner_marker_memory[marker_id]
+
+    def get_all_non_corner_markers(current_time):
+        """
+        Get all non-corner markers (current + memory within timeout)
+        """
+        all_markers = {}
+        
+        # Add markers from memory that are still within timeout
+        for marker_id, memory_data in non_corner_marker_memory.items():
+            if current_time - memory_data['timestamp'] <= non_corner_memory_timeout:
+                all_markers[marker_id] = memory_data['center']
+        
+        return all_markers
 
     def determine_grid_corners(marker_centers):
         """
@@ -189,6 +228,120 @@ def detect_aruco_markers():
         
         return transform, grid_size
 
+    def create_rectified_view(frame, perspective_transform, grid_size, marker_data, ids, corners, marker_memory, current_time):
+        """
+        Create a rectified view of the camera feed using corner pin transformation
+        """
+        if perspective_transform is None:
+            return None
+        
+        # Use 1920x1080 resolution for the rectified view
+        rectified_width = 1920
+        rectified_height = 1080
+        
+        # Extract marker centers from memory for corner detection
+        marker_centers = {}
+        for marker_id, memory_data in marker_memory.items():
+            if marker_id in REFERENCE_MARKERS:
+                marker_centers[marker_id] = memory_data['center']
+        
+        # Get the source corner points from the detected reference markers
+        src_corners = []
+        grid_corners = determine_grid_corners(marker_centers)
+        
+        if grid_corners is None:
+            return None
+        
+        # Get corner positions from memory
+        for marker_id in grid_corners:
+            if marker_id in marker_memory:
+                src_corners.append(marker_memory[marker_id]['center'])
+            else:
+                return None  # Can't create transform without all corners
+        
+        # Convert to numpy array and ensure proper order: top-left, top-right, bottom-left, bottom-right
+        src_corners = np.float32(src_corners)
+        
+        # Define destination corners for perfect rectangle (16:9 aspect ratio)
+        dst_corners = np.float32([
+            [0, 0],                           # top-left
+            [rectified_width, 0],             # top-right
+            [0, rectified_height],            # bottom-left
+            [rectified_width, rectified_height]  # bottom-right
+        ])
+        
+        # Calculate the corner pin transformation matrix
+        corner_pin_transform = cv2.getPerspectiveTransform(src_corners, dst_corners)
+        
+        # Apply the corner pin transformation to the entire frame
+        rectified_frame = cv2.warpPerspective(frame, corner_pin_transform, (rectified_width, rectified_height))
+        
+        # Create a list to track which sections contain markers
+        occupied_sections = set()
+        
+        # Get all non-corner markers (current + memory within timeout)
+        all_non_corner_markers = get_all_non_corner_markers(current_time)
+        
+        # Check all non-corner markers (current and from memory)
+        for marker_id, center in all_non_corner_markers.items():
+            # Transform marker center to perspective-corrected space
+            marker_point = np.array([[center[0], center[1]]], dtype=np.float32)
+            marker_point = marker_point.reshape(-1, 1, 2)
+            transformed_point = cv2.perspectiveTransform(marker_point, corner_pin_transform)
+            
+            # Get grid section in perspective-corrected space
+            grid_section = get_grid_section(transformed_point[0][0][0], 
+                                         transformed_point[0][0][1],
+                                         rectified_width, rectified_height)
+            occupied_sections.add(grid_section)
+        
+        # Also check markers from persistent data
+        for marker_id, data in marker_data.items():
+            if int(marker_id) not in REFERENCE_MARKERS:
+                occupied_sections.add(data['grid_section'])
+        
+        # Draw transparent blue overlay for occupied sections
+        overlay = rectified_frame.copy()
+        for section in occupied_sections:
+            if 1 <= section <= 12:
+                # Calculate section boundaries
+                row = (section - 1) // 4  # 0, 1, 2
+                col = (section - 1) % 4   # 0, 1, 2, 3
+                
+                x1 = int(col * rectified_width / 4)
+                y1 = int(row * rectified_height / 3)
+                x2 = int((col + 1) * rectified_width / 4)
+                y2 = int((row + 1) * rectified_height / 3)
+                
+                # Draw semi-transparent blue rectangle
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 0, 0), -1)  # Blue fill
+        
+        # Blend the overlay with the original frame (transparency effect)
+        alpha = 0.3  # Transparency factor (0.0 = fully transparent, 1.0 = fully opaque)
+        rectified_frame = cv2.addWeighted(rectified_frame, 1 - alpha, overlay, alpha, 0)
+        
+        # Draw grid lines on the rectified view
+        # Vertical lines (5 lines for 4 sections)
+        for i in range(5):
+            x = int(i * rectified_width / 4)
+            cv2.line(rectified_frame, (x, 0), (x, rectified_height), (0, 255, 0), 2)
+        
+        # Horizontal lines (4 lines for 3 sections)
+        for j in range(4):
+            y = int(j * rectified_height / 3)
+            cv2.line(rectified_frame, (0, y), (rectified_width, y), (0, 255, 0), 2)
+        
+        # Add section numbers
+        for row in range(3):
+            for col in range(4):
+                section_num = row * 4 + col + 1
+                center_x = int((col + 0.5) * rectified_width / 4)
+                center_y = int((row + 0.5) * rectified_height / 3)
+                cv2.putText(rectified_frame, str(section_num), (center_x - 10, center_y + 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        return rectified_frame
+
     try:
         while True:
             ret, frame = cap.read()
@@ -222,6 +375,9 @@ def detect_aruco_markers():
             corners, ids, rejected = detector.detectMarkers(processed_frame)
             
             current_time = time.time()
+            
+            # Update non-corner marker memory
+            update_non_corner_marker_memory(ids, corners, current_time)
             
             # Always try to calculate perspective transform (uses memory if needed)
             perspective_transform, grid_size = calculate_perspective_transform(corners, ids, current_time)
@@ -267,30 +423,28 @@ def detect_aruco_markers():
                                     (0, 255, 0), 2)
                 
                 # Process each detected marker for grid position
-                if current_time - last_save_time >= save_interval and ids is not None:
-                    for i, marker_id in enumerate(ids):
-                        if marker_id[0] not in REFERENCE_MARKERS:  # Skip reference markers
-                            marker_corners = corners[i][0]
-                            center_x = int(np.mean([corner[0] for corner in marker_corners]))
-                            center_y = int(np.mean([corner[1] for corner in marker_corners]))
-                            
-                            # Transform marker center to perspective-corrected space
-                            marker_point = np.array([[center_x, center_y]], dtype=np.float32)
-                            marker_point = marker_point.reshape(-1, 1, 2)
-                            transformed_point = cv2.perspectiveTransform(marker_point, perspective_transform)
-                            
-                            # Get grid section in perspective-corrected space
-                            grid_section = get_grid_section(transformed_point[0][0][0], 
-                                                         transformed_point[0][0][1],
-                                                         grid_size, grid_size)
-                            
-                            # Update marker data only if section has changed
-                            marker_id_str = str(marker_id[0])
-                            if marker_id_str not in marker_data or marker_data[marker_id_str]["grid_section"] != grid_section:
-                                marker_data[marker_id_str] = {
-                                    "grid_section": grid_section
-                                }
-                                print(f"Marker {marker_id[0]} moved to grid section {grid_section}")
+                if current_time - last_save_time >= save_interval:
+                    # Get all non-corner markers (current + memory within timeout)
+                    all_non_corner_markers = get_all_non_corner_markers(current_time)
+                    
+                    for marker_id, center in all_non_corner_markers.items():
+                        # Transform marker center to perspective-corrected space
+                        marker_point = np.array([[center[0], center[1]]], dtype=np.float32)
+                        marker_point = marker_point.reshape(-1, 1, 2)
+                        transformed_point = cv2.perspectiveTransform(marker_point, perspective_transform)
+                        
+                        # Get grid section in perspective-corrected space
+                        grid_section = get_grid_section(transformed_point[0][0][0], 
+                                                     transformed_point[0][0][1],
+                                                     grid_size, grid_size)
+                        
+                        # Update marker data only if section has changed
+                        marker_id_str = str(marker_id)
+                        if marker_id_str not in marker_data or marker_data[marker_id_str]["grid_section"] != grid_section:
+                            marker_data[marker_id_str] = {
+                                "grid_section": grid_section
+                            }
+                            print(f"Marker {marker_id} moved to grid section {grid_section}")
                     
                     # Save to JSON file
                     with open(json_file, 'w') as f:
@@ -346,9 +500,50 @@ def detect_aruco_markers():
                 cv2.putText(display_frame, f"Marker {marker_id}: {status}", (10, y_offset), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 y_offset += 20
+            
+            # Display non-corner marker status
+            y_offset += 25  # Add some space
+            cv2.putText(display_frame, "Non-Corner Markers:", (10, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            y_offset += 25
+            
+            # Get all non-corner markers for display
+            all_non_corner_markers = get_all_non_corner_markers(current_time)
+            
+            if all_non_corner_markers:
+                for marker_id, center in all_non_corner_markers.items():
+                    if marker_id in non_corner_marker_memory:
+                        age = current_time - non_corner_marker_memory[marker_id]['timestamp']
+                        if age < 0.1:  # Currently detected
+                            status = "DETECTED"
+                            color = (0, 255, 0)
+                        else:  # From memory
+                            time_left = non_corner_memory_timeout - age
+                            status = f"MEMORY ({time_left:.1f}s left)"
+                            color = (0, 255, 255)
+                        
+                        cv2.putText(display_frame, f"Marker {marker_id}: {status}", (10, y_offset), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        y_offset += 20
+            else:
+                cv2.putText(display_frame, "No non-corner markers detected", (10, y_offset), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+                y_offset += 20
 
             # Display the frame
             cv2.imshow('Perspective Grid ArUco Marker Detection', display_frame)
+            
+            # Create and display rectified view
+            if perspective_transform is not None:
+                rectified_frame = create_rectified_view(frame, perspective_transform, grid_size, marker_data, ids, corners, marker_memory, current_time)
+                if rectified_frame is not None:
+                    cv2.imshow('Rectified Camera View', rectified_frame)
+            else:
+                # If no transform available, show a blank or message frame
+                blank_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)  # 1920x1080 resolution
+                cv2.putText(blank_frame, "Waiting for 4 reference markers...", (700, 540),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.imshow('Rectified Camera View', blank_frame)
 
             # Break loop with 'q' key
             if cv2.waitKey(1) & 0xFF == ord('q'):

@@ -6,6 +6,10 @@ from datetime import datetime
 from pathlib import Path
 
 def detect_aruco_markers():
+    # Grid configuration
+    GRID_WIDTH_SECTIONS = 4   # Number of sections horizontally
+    GRID_HEIGHT_SECTIONS = 3  # Number of sections vertically
+    
     # Configuration flags
     USE_GRAYSCALE = False   # Set to True for grayscale conversion
     USE_THRESHOLD = False   # Set to True for thresholding
@@ -54,7 +58,7 @@ def detect_aruco_markers():
     
     # Marker memory system - store last seen positions
     marker_memory = {}  # Store last seen positions of reference markers
-    memory_timeout = 90.0  # How long to remember markers (seconds)
+    memory_timeout = 1000.0  # How long to remember markers (seconds)
     
     # Non-corner marker memory system
     non_corner_marker_memory = {}  # Store last seen positions of non-corner markers
@@ -65,23 +69,24 @@ def detect_aruco_markers():
     elem_dir.mkdir(exist_ok=True)
 
     json_file = elem_dir / 'perspective_grid_locations.json'
+    target_sections_file = elem_dir / 'target_sections.json'
     marker_data = {}  # Empty dictionary to store marker data
     with open(json_file, 'w') as f:
         json.dump(marker_data, f, indent=4)
     print("JSON file cleared and initialized")
 
     def get_grid_section(x, y, width, height):
-        # Calculate grid section (1-12) in the perspective-corrected space
-        # 4 sections wide, 3 sections tall
-        section_width = width / 4
-        section_height = height / 3
+        # Calculate grid section (1-48) in the perspective-corrected space
+        # 8 sections wide, 6 sections tall
+        section_width = width / GRID_WIDTH_SECTIONS
+        section_height = height / GRID_HEIGHT_SECTIONS
         
-        grid_x = min(int(x / section_width), 3)  # 0-3 for 4 columns
-        grid_y = min(int(y / section_height), 2)  # 0-2 for 3 rows
+        grid_x = min(int(x / section_width), GRID_WIDTH_SECTIONS - 1)  # 0-7 for 8 columns
+        grid_y = min(int(y / section_height), GRID_HEIGHT_SECTIONS - 1)  # 0-5 for 6 rows
         
-        # Convert to 1-12 grid numbering (1 is top-left, 12 is bottom-right)
-        # Row 1: 1,2,3,4 | Row 2: 5,6,7,8 | Row 3: 9,10,11,12
-        return grid_y * 4 + grid_x + 1
+        # Convert to 1-N grid numbering (1 is top-left, N is bottom-right)
+        # Row 1: 1,2,3,...,W | Row 2: W+1,W+2,...,2W | ... | Row H: (H-1)*W+1,...,H*W
+        return grid_y * GRID_WIDTH_SECTIONS + grid_x + 1
 
     def update_non_corner_marker_memory(ids, corners, current_time):
         """
@@ -117,6 +122,51 @@ def detect_aruco_markers():
                 all_markers[marker_id] = memory_data['center']
         
         return all_markers
+    
+    def cleanup_expired_markers_from_json(current_time):
+        """
+        Remove non-corner markers from JSON file that have exceeded their timeout
+        """
+        markers_to_remove = []
+        
+        for marker_id_str, data in marker_data.items():
+            marker_id = int(marker_id_str)
+            if marker_id not in REFERENCE_MARKERS:  # Only check non-corner markers
+                # Check if marker is in memory and has expired
+                if marker_id in non_corner_marker_memory:
+                    age = current_time - non_corner_marker_memory[marker_id]['timestamp']
+                    if age > non_corner_memory_timeout:
+                        markers_to_remove.append(marker_id_str)
+                        print(f"Removing expired marker {marker_id} from JSON (age: {age:.1f}s)")
+                else:
+                    # Marker not in memory at all, remove it
+                    markers_to_remove.append(marker_id_str)
+                    print(f"Removing missing marker {marker_id} from JSON")
+        
+        # Remove expired markers from marker_data
+        for marker_id_str in markers_to_remove:
+            del marker_data[marker_id_str]
+        
+        return len(markers_to_remove) > 0  # Return True if any markers were removed
+
+    def get_target_sections():
+        """
+        Read target sections from JSON file
+        """
+        try:
+            if target_sections_file.exists():
+                with open(target_sections_file, 'r') as f:
+                    data = json.load(f)
+                
+                player_a_target = data.get("player_a", {}).get("target_section")
+                player_b_target = data.get("player_b", {}).get("target_section")
+                
+                return player_a_target, player_b_target
+            else:
+                return None, None
+        except Exception as e:
+            print(f"Error reading target sections: {e}")
+            return None, None
 
     def determine_grid_corners(marker_centers):
         """
@@ -228,7 +278,7 @@ def detect_aruco_markers():
         
         return transform, grid_size
 
-    def create_rectified_view(frame, perspective_transform, grid_size, marker_data, ids, corners, marker_memory, current_time):
+    def create_rectified_view(frame, perspective_transform, grid_size, marker_data, ids, corners, marker_memory, current_time, occupied_sections):
         """
         Create a rectified view of the camera feed using corner pin transformation
         """
@@ -276,69 +326,117 @@ def detect_aruco_markers():
         # Apply the corner pin transformation to the entire frame
         rectified_frame = cv2.warpPerspective(frame, corner_pin_transform, (rectified_width, rectified_height))
         
-        # Create a list to track which sections contain markers
-        occupied_sections = set()
+        # Use the occupied_sections passed from the main loop
         
-        # Get all non-corner markers (current + memory within timeout)
-        all_non_corner_markers = get_all_non_corner_markers(current_time)
+        # Get target sections
+        player_a_target, player_b_target = get_target_sections()
         
-        # Check all non-corner markers (current and from memory)
-        for marker_id, center in all_non_corner_markers.items():
-            # Transform marker center to perspective-corrected space
-            marker_point = np.array([[center[0], center[1]]], dtype=np.float32)
-            marker_point = marker_point.reshape(-1, 1, 2)
-            transformed_point = cv2.perspectiveTransform(marker_point, corner_pin_transform)
-            
-            # Get grid section in perspective-corrected space
-            grid_section = get_grid_section(transformed_point[0][0][0], 
-                                         transformed_point[0][0][1],
-                                         rectified_width, rectified_height)
-            occupied_sections.add(grid_section)
-        
-        # Also check markers from persistent data
-        for marker_id, data in marker_data.items():
-            if int(marker_id) not in REFERENCE_MARKERS:
-                occupied_sections.add(data['grid_section'])
-        
-        # Draw transparent blue overlay for occupied sections
+        # Draw overlays for different section types
         overlay = rectified_frame.copy()
+        
+        # Get current player positions from marker data
+        player_a_section = None
+        player_b_section = None
+        
+        for marker_id, data in marker_data.items():
+            if int(marker_id) == 100:  # Player A
+                player_a_section = data.get('grid_section')
+            elif int(marker_id) == 88:  # Player B
+                player_b_section = data.get('grid_section')
+        
+        # Draw transparent blue overlay for occupied sections (excluding player tags)
+        total_sections = GRID_WIDTH_SECTIONS * GRID_HEIGHT_SECTIONS
         for section in occupied_sections:
-            if 1 <= section <= 12:
+            if 1 <= section <= total_sections and section != player_a_section and section != player_b_section:
                 # Calculate section boundaries
-                row = (section - 1) // 4  # 0, 1, 2
-                col = (section - 1) % 4   # 0, 1, 2, 3
+                row = (section - 1) // GRID_WIDTH_SECTIONS  # 0, 1, 2, 3, 4, 5
+                col = (section - 1) % GRID_WIDTH_SECTIONS   # 0, 1, 2, 3, 4, 5, 6, 7
                 
-                x1 = int(col * rectified_width / 4)
-                y1 = int(row * rectified_height / 3)
-                x2 = int((col + 1) * rectified_width / 4)
-                y2 = int((row + 1) * rectified_height / 3)
+                x1 = int(col * rectified_width / GRID_WIDTH_SECTIONS)
+                y1 = int(row * rectified_height / GRID_HEIGHT_SECTIONS)
+                x2 = int((col + 1) * rectified_width / GRID_WIDTH_SECTIONS)
+                y2 = int((row + 1) * rectified_height / GRID_HEIGHT_SECTIONS)
                 
                 # Draw semi-transparent blue rectangle
                 cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 0, 0), -1)  # Blue fill
+        
+        # Draw current player position overlays
+        if player_a_section is not None and 1 <= player_a_section <= total_sections:
+            # Calculate section boundaries for Player A current position
+            row = (player_a_section - 1) // GRID_WIDTH_SECTIONS
+            col = (player_a_section - 1) % GRID_WIDTH_SECTIONS
+            
+            x1 = int(col * rectified_width / GRID_WIDTH_SECTIONS)
+            y1 = int(row * rectified_height / GRID_HEIGHT_SECTIONS)
+            x2 = int((col + 1) * rectified_width / GRID_WIDTH_SECTIONS)
+            y2 = int((row + 1) * rectified_height / GRID_HEIGHT_SECTIONS)
+            
+            # Draw semi-transparent blue rectangle for Player A current position
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 0, 0), -1)  # Blue fill
+        
+        if player_b_section is not None and 1 <= player_b_section <= total_sections:
+            # Calculate section boundaries for Player B current position
+            row = (player_b_section - 1) // GRID_WIDTH_SECTIONS
+            col = (player_b_section - 1) % GRID_WIDTH_SECTIONS
+            
+            x1 = int(col * rectified_width / GRID_WIDTH_SECTIONS)
+            y1 = int(row * rectified_height / GRID_HEIGHT_SECTIONS)
+            x2 = int((col + 1) * rectified_width / GRID_WIDTH_SECTIONS)
+            y2 = int((row + 1) * rectified_height / GRID_HEIGHT_SECTIONS)
+            
+            # Draw semi-transparent greenish-blue rectangle for Player B current position
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 191, 0), -1)  # Greenish-blue fill
+        
+        # Draw target section overlays
+        if player_a_target is not None and 1 <= player_a_target <= total_sections:
+            # Calculate section boundaries for Player A target
+            row = (player_a_target - 1) // GRID_WIDTH_SECTIONS
+            col = (player_a_target - 1) % GRID_WIDTH_SECTIONS
+            
+            x1 = int(col * rectified_width / GRID_WIDTH_SECTIONS)
+            y1 = int(row * rectified_height / GRID_HEIGHT_SECTIONS)
+            x2 = int((col + 1) * rectified_width / GRID_WIDTH_SECTIONS)
+            y2 = int((row + 1) * rectified_height / GRID_HEIGHT_SECTIONS)
+            
+            # Draw semi-transparent yellow rectangle for Player A target
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 255), -1)  # Yellow fill
+        
+        if player_b_target is not None and 1 <= player_b_target <= total_sections:
+            # Calculate section boundaries for Player B target
+            row = (player_b_target - 1) // GRID_WIDTH_SECTIONS
+            col = (player_b_target - 1) % GRID_WIDTH_SECTIONS
+            
+            x1 = int(col * rectified_width / GRID_WIDTH_SECTIONS)
+            y1 = int(row * rectified_height / GRID_HEIGHT_SECTIONS)
+            x2 = int((col + 1) * rectified_width / GRID_WIDTH_SECTIONS)
+            y2 = int((row + 1) * rectified_height / GRID_HEIGHT_SECTIONS)
+            
+            # Draw semi-transparent orange rectangle for Player B target
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 165, 255), -1)  # Orange fill
         
         # Blend the overlay with the original frame (transparency effect)
         alpha = 0.3  # Transparency factor (0.0 = fully transparent, 1.0 = fully opaque)
         rectified_frame = cv2.addWeighted(rectified_frame, 1 - alpha, overlay, alpha, 0)
         
         # Draw grid lines on the rectified view
-        # Vertical lines (5 lines for 4 sections)
-        for i in range(5):
-            x = int(i * rectified_width / 4)
+        # Vertical lines (W+1 lines for W sections)
+        for i in range(GRID_WIDTH_SECTIONS + 1):
+            x = int(i * rectified_width / GRID_WIDTH_SECTIONS)
             cv2.line(rectified_frame, (x, 0), (x, rectified_height), (0, 255, 0), 2)
         
-        # Horizontal lines (4 lines for 3 sections)
-        for j in range(4):
-            y = int(j * rectified_height / 3)
+        # Horizontal lines (H+1 lines for H sections)
+        for j in range(GRID_HEIGHT_SECTIONS + 1):
+            y = int(j * rectified_height / GRID_HEIGHT_SECTIONS)
             cv2.line(rectified_frame, (0, y), (rectified_width, y), (0, 255, 0), 2)
         
         # Add section numbers
-        for row in range(3):
-            for col in range(4):
-                section_num = row * 4 + col + 1
-                center_x = int((col + 0.5) * rectified_width / 4)
-                center_y = int((row + 0.5) * rectified_height / 3)
+        for row in range(GRID_HEIGHT_SECTIONS):
+            for col in range(GRID_WIDTH_SECTIONS):
+                section_num = row * GRID_WIDTH_SECTIONS + col + 1
+                center_x = int((col + 0.5) * rectified_width / GRID_WIDTH_SECTIONS)
+                center_y = int((row + 0.5) * rectified_height / GRID_HEIGHT_SECTIONS)
                 cv2.putText(rectified_frame, str(section_num), (center_x - 10, center_y + 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return rectified_frame
 
@@ -382,17 +480,46 @@ def detect_aruco_markers():
             # Always try to calculate perspective transform (uses memory if needed)
             perspective_transform, grid_size = calculate_perspective_transform(corners, ids, current_time)
             
+            # Calculate occupied sections for both views
+            occupied_sections = set()
+            if perspective_transform is not None:
+                # Get all non-corner markers (current + memory within timeout)
+                all_non_corner_markers = get_all_non_corner_markers(current_time)
+                
+                # Check all non-corner markers (current and from memory)
+                for marker_id, center in all_non_corner_markers.items():
+                    # Transform marker center to perspective-corrected space
+                    marker_point = np.array([[center[0], center[1]]], dtype=np.float32)
+                    marker_point = marker_point.reshape(-1, 1, 2)
+                    transformed_point = cv2.perspectiveTransform(marker_point, perspective_transform)
+                    
+                    # Get grid section in perspective-corrected space
+                    grid_section = get_grid_section(transformed_point[0][0][0], 
+                                                 transformed_point[0][0][1],
+                                                 grid_size, grid_size)
+                    occupied_sections.add(grid_section)
+                
+                # Also check markers from persistent data (only if they're still active)
+                for marker_id, data in marker_data.items():
+                    marker_id_int = int(marker_id)
+                    if marker_id_int not in REFERENCE_MARKERS:
+                        # Only add to occupied sections if marker is still in memory and not expired
+                        if marker_id_int in non_corner_marker_memory:
+                            age = current_time - non_corner_marker_memory[marker_id_int]['timestamp']
+                            if age <= non_corner_memory_timeout:
+                                occupied_sections.add(data['grid_section'])
+            
             if ids is not None:
                 # Draw all detected markers
                 cv2.aruco.drawDetectedMarkers(display_frame, corners, ids)
             
             # Draw grid if we have a valid transform
             if perspective_transform is not None:
-                # Draw the perspective-corrected grid (4x3)
+                # Draw the perspective-corrected grid (WxH)
                 grid_points = []
-                for i in range(5):  # 5 vertical lines for 4 sections
-                    for j in range(4):  # 4 horizontal lines for 3 sections
-                        grid_points.append([i * grid_size/4, j * grid_size/3])
+                for i in range(GRID_WIDTH_SECTIONS + 1):  # W+1 vertical lines for W sections
+                    for j in range(GRID_HEIGHT_SECTIONS + 1):  # H+1 horizontal lines for H sections
+                        grid_points.append([i * grid_size/GRID_WIDTH_SECTIONS, j * grid_size/GRID_HEIGHT_SECTIONS])
                 
                 # Transform grid points back to original perspective
                 grid_points = np.array(grid_points, dtype=np.float32)
@@ -400,30 +527,127 @@ def detect_aruco_markers():
                 transformed_points = cv2.perspectiveTransform(grid_points, np.linalg.inv(perspective_transform))
                 
                 # Draw the grid lines
-                # Vertical lines (5 lines for 4 sections)
-                for i in range(5):
-                    for j in range(3):  # 3 horizontal positions
-                        start_idx = i * 4 + j
-                        end_idx = i * 4 + j + 1
+                # Vertical lines (W+1 lines for W sections)
+                for i in range(GRID_WIDTH_SECTIONS + 1):
+                    for j in range(GRID_HEIGHT_SECTIONS):  # H horizontal positions
+                        start_idx = i * (GRID_HEIGHT_SECTIONS + 1) + j
+                        end_idx = i * (GRID_HEIGHT_SECTIONS + 1) + j + 1
                         if end_idx < len(transformed_points):
                             cv2.line(display_frame, 
                                     (int(transformed_points[start_idx][0][0]), int(transformed_points[start_idx][0][1])),
                                     (int(transformed_points[end_idx][0][0]), int(transformed_points[end_idx][0][1])),
                                     (0, 255, 0), 2)
                 
-                # Horizontal lines (4 lines for 3 sections)
-                for j in range(4):
-                    for i in range(4):  # 4 vertical positions
-                        start_idx = i * 4 + j
-                        end_idx = (i + 1) * 4 + j
+                # Horizontal lines (H+1 lines for H sections)
+                for j in range(GRID_HEIGHT_SECTIONS + 1):
+                    for i in range(GRID_WIDTH_SECTIONS):  # W vertical positions
+                        start_idx = i * (GRID_HEIGHT_SECTIONS + 1) + j
+                        end_idx = (i + 1) * (GRID_HEIGHT_SECTIONS + 1) + j
                         if end_idx < len(transformed_points):
                             cv2.line(display_frame,
                                     (int(transformed_points[start_idx][0][0]), int(transformed_points[start_idx][0][1])),
                                     (int(transformed_points[end_idx][0][0]), int(transformed_points[end_idx][0][1])),
                                     (0, 255, 0), 2)
                 
+                # Add section overlays and numbers to the normal view
+                total_sections = GRID_WIDTH_SECTIONS * GRID_HEIGHT_SECTIONS
+                
+                # Get target sections
+                player_a_target, player_b_target = get_target_sections()
+                
+                # Get current player positions from marker data
+                player_a_section = None
+                player_b_section = None
+                
+                for marker_id, data in marker_data.items():
+                    if int(marker_id) == 100:  # Player A
+                        player_a_section = data.get('grid_section')
+                    elif int(marker_id) == 88:  # Player B
+                        player_b_section = data.get('grid_section')
+                
+                # Create overlay for normal view
+                overlay = display_frame.copy()
+                
+                # Draw section overlays and numbers by transforming section corners back to original perspective
+                for row in range(GRID_HEIGHT_SECTIONS):
+                    for col in range(GRID_WIDTH_SECTIONS):
+                        section_num = row * GRID_WIDTH_SECTIONS + col + 1
+                        
+                        # Calculate the four corners of this section in perspective-corrected space
+                        top_left_x = col * grid_size / GRID_WIDTH_SECTIONS
+                        top_left_y = row * grid_size / GRID_HEIGHT_SECTIONS
+                        top_right_x = (col + 1) * grid_size / GRID_WIDTH_SECTIONS
+                        top_right_y = row * grid_size / GRID_HEIGHT_SECTIONS
+                        bottom_left_x = col * grid_size / GRID_WIDTH_SECTIONS
+                        bottom_left_y = (row + 1) * grid_size / GRID_HEIGHT_SECTIONS
+                        bottom_right_x = (col + 1) * grid_size / GRID_WIDTH_SECTIONS
+                        bottom_right_y = (row + 1) * grid_size / GRID_HEIGHT_SECTIONS
+                        
+                        # Transform all four corners back to original perspective
+                        corners = np.array([
+                            [top_left_x, top_left_y],
+                            [top_right_x, top_right_y],
+                            [bottom_right_x, bottom_right_y],
+                            [bottom_left_x, bottom_left_y]
+                        ], dtype=np.float32)
+                        corners = corners.reshape(-1, 1, 2)
+                        transformed_corners = cv2.perspectiveTransform(corners, np.linalg.inv(perspective_transform))
+                        
+                        # Get the transformed corner coordinates
+                        top_left = (int(transformed_corners[0][0][0]), int(transformed_corners[0][0][1]))
+                        top_right = (int(transformed_corners[1][0][0]), int(transformed_corners[1][0][1]))
+                        bottom_right = (int(transformed_corners[2][0][0]), int(transformed_corners[2][0][1]))
+                        bottom_left = (int(transformed_corners[3][0][0]), int(transformed_corners[3][0][1]))
+                        
+                        # Calculate center point for section number
+                        center_x = int((top_left[0] + top_right[0] + bottom_left[0] + bottom_right[0]) / 4)
+                        center_y = int((top_left[1] + top_right[1] + bottom_left[1] + bottom_right[1]) / 4)
+                        
+                        # Determine section color based on type
+                        color = None
+                        alpha = 0.3
+                        
+                        if section_num == player_a_section:
+                            color = (255, 0, 0)  # Blue for Player A current position
+                        elif section_num == player_b_section:
+                            color = (255, 191, 0)  # Greenish-blue for Player B current position
+                        elif section_num == player_a_target:
+                            color = (0, 255, 255)  # Yellow for Player A target
+                        elif section_num == player_b_target:
+                            color = (0, 165, 255)  # Orange for Player B target
+                        elif section_num in occupied_sections:
+                            # Check if this section contains any non-player markers (not 88 or 100)
+                            has_non_player_marker = False
+                            for marker_id, data in marker_data.items():
+                                marker_id_int = int(marker_id)
+                                if marker_id_int not in [88, 100] and marker_id_int not in REFERENCE_MARKERS:
+                                    if data.get('grid_section') == section_num:
+                                        has_non_player_marker = True
+                                        break
+                            
+                            if has_non_player_marker:
+                                color = (0, 255, 0)  # Green for sections with non-player markers
+                            else:
+                                color = (255, 0, 0)  # Blue for other occupied sections
+                        
+                        # Draw section overlay if it has a color
+                        if color is not None:
+                            # Create polygon points for the section
+                            section_points = np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.int32)
+                            cv2.fillPoly(overlay, [section_points], color)
+                        
+                        # Draw section number
+                        cv2.putText(overlay, str(section_num), (center_x - 10, center_y + 5),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Blend the overlay with the original frame
+                display_frame = cv2.addWeighted(display_frame, 1 - alpha, overlay, alpha, 0)
+                
                 # Process each detected marker for grid position
                 if current_time - last_save_time >= save_interval:
+                    # Clean up expired markers from JSON file
+                    cleanup_expired_markers_from_json(current_time)
+                    
                     # Get all non-corner markers (current + memory within timeout)
                     all_non_corner_markers = get_all_non_corner_markers(current_time)
                     
@@ -535,7 +759,7 @@ def detect_aruco_markers():
             
             # Create and display rectified view
             if perspective_transform is not None:
-                rectified_frame = create_rectified_view(frame, perspective_transform, grid_size, marker_data, ids, corners, marker_memory, current_time)
+                rectified_frame = create_rectified_view(frame, perspective_transform, grid_size, marker_data, ids, corners, marker_memory, current_time, occupied_sections)
                 if rectified_frame is not None:
                     cv2.imshow('Rectified Camera View', rectified_frame)
             else:
